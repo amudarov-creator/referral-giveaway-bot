@@ -8,7 +8,8 @@ import threading
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.storage.base import BaseStorage
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 from redis.asyncio import Redis
@@ -43,16 +44,39 @@ async def on_shutdown(bot: Bot) -> None:
     logger.info("shutdown")
 
 
-def create_dispatcher(redis: Redis) -> Dispatcher:
-    storage = RedisStorage(redis=redis)
+async def _try_redis(url: str) -> Redis | None:
+    """Connect to Redis; return None if unavailable (MemoryStorage fallback)."""
+    client = Redis.from_url(url, decode_responses=True, socket_connect_timeout=2)
+    try:
+        await client.ping()
+        safe = url.split("@")[-1] if "@" in url else url
+        logger.info("redis_connected", url=safe)
+        return client
+    except Exception as e:
+        logger.warning(
+            "redis_unavailable_using_memory_storage",
+            error=str(e),
+            hint="Set REDIS_URL to a reachable Redis. FSM will not persist across restarts.",
+        )
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        return None
+
+
+def create_dispatcher(storage: BaseStorage, redis: Redis | None) -> Dispatcher:
     dp = Dispatcher(storage=storage)
 
     dp.message.middleware(DbSessionMiddleware())
     dp.callback_query.middleware(DbSessionMiddleware())
     dp.chat_member.middleware(DbSessionMiddleware())
 
-    dp.message.middleware(RateLimitMiddleware(redis))
-    dp.callback_query.middleware(RateLimitMiddleware(redis))
+    if redis is not None:
+        dp.message.middleware(RateLimitMiddleware(redis))
+        dp.callback_query.middleware(RateLimitMiddleware(redis))
+    else:
+        logger.warning("rate_limit_disabled_no_redis")
 
     admin.router.message.middleware(AdminOnlyMiddleware())
     admin.router.callback_query.middleware(AdminOnlyMiddleware())
@@ -77,7 +101,6 @@ def _make_health_app() -> web.Application:
 
 
 def _start_health_server(port: int) -> web.AppRunner:
-    """Run a tiny /health HTTP server in a background thread (polling mode)."""
     loop = asyncio.new_event_loop()
     app = _make_health_app()
     runner = web.AppRunner(app)
@@ -95,35 +118,47 @@ def _start_health_server(port: int) -> web.AppRunner:
     return runner
 
 
+async def _build_storage_and_redis() -> tuple[BaseStorage, Redis | None]:
+    settings = get_settings()
+    redis = await _try_redis(settings.redis_url)
+    if redis is not None:
+        from aiogram.fsm.storage.redis import RedisStorage
+
+        return RedisStorage(redis=redis), redis
+    return MemoryStorage(), None
+
+
 async def run_polling() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
     _start_health_server(settings.health_port)
 
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    storage, redis = await _build_storage_and_redis()
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = create_dispatcher(redis)
+    dp = create_dispatcher(storage, redis)
     try:
         await dp.start_polling(
             bot,
             allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
         )
     finally:
-        await redis.aclose()
+        if redis is not None:
+            await redis.aclose()
 
 
-def run_webhook() -> None:
+async def _run_webhook_async() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+
+    storage, redis = await _build_storage_and_redis()
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = create_dispatcher(redis)
+    dp = create_dispatcher(storage, redis)
 
     app = web.Application()
     SimpleRequestHandler(
@@ -138,13 +173,23 @@ def run_webhook() -> None:
 
     app.router.add_get("/health", health)
 
-    web.run_app(app, host="0.0.0.0", port=settings.health_port)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", settings.health_port)
+    await site.start()
+    logger.info("webhook_server_started", port=settings.health_port)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        if redis is not None:
+            await redis.aclose()
+        await runner.cleanup()
 
 
 def main() -> None:
     settings = get_settings()
     if settings.is_webhook:
-        run_webhook()
+        asyncio.run(_run_webhook_async())
     else:
         asyncio.run(run_polling())
 
