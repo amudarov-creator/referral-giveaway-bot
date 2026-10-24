@@ -26,6 +26,15 @@ logger = get_logger(__name__)
 
 async def on_startup(bot: Bot) -> None:
     settings = get_settings()
+    # Create tables if missing (phone-friendly deploys without shell access)
+    try:
+        from app.db.migrate import run_migrations
+
+        run_migrations()
+    except Exception as e:
+        logger.error("migrations_failed", error=str(e))
+        raise
+
     if settings.is_webhook and settings.webhook_host:
         url = f"{settings.webhook_host.rstrip('/')}{settings.webhook_path}"
         await bot.set_webhook(
