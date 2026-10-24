@@ -1,7 +1,9 @@
 """Application entrypoint."""
 
+from __future__ import annotations
+
 import asyncio
-import sys
+import threading
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -64,9 +66,40 @@ def create_dispatcher(redis: Redis) -> Dispatcher:
     return dp
 
 
+def _make_health_app() -> web.Application:
+    app = web.Application()
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
+
+    app.router.add_get("/health", health)
+    return app
+
+
+def _start_health_server(port: int) -> web.AppRunner:
+    """Run a tiny /health HTTP server in a background thread (polling mode)."""
+    loop = asyncio.new_event_loop()
+    app = _make_health_app()
+    runner = web.AppRunner(app)
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(runner.setup())
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        loop.run_until_complete(site.start())
+        logger.info("health_server_started", port=port)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_run, name="health-server", daemon=True)
+    thread.start()
+    return runner
+
+
 async def run_polling() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
+    _start_health_server(settings.health_port)
+
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     bot = Bot(
         token=settings.bot_token,
