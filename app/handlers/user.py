@@ -121,25 +121,64 @@ async def show_rules(event: Message | CallbackQuery, session: AsyncSession) -> N
         await event.answer(text)
 
 
+async def _issue_personal_link(
+    *,
+    user_id: int,
+    giveaway_id: str,
+    session: AsyncSession,
+    bot,
+) -> str:
+    svc = InviteLinkService(session, bot)
+    link = await svc.get_or_create_personal_link(user_id=user_id, giveaway_id=giveaway_id)
+    return (
+        f"Your personal invite link:\n<code>{link.invite_link}</code>\n\n"
+        "Share it. Only joins that Telegram reports with this exact link "
+        "are counted. One person = one referral max."
+    )
+
+
 @router.callback_query(F.data.startswith("getlink:"))
 async def get_link(callback: CallbackQuery, session: AsyncSession, bot) -> None:
     giveaway_id = callback.data.split(":", 1)[1]
     try:
-        svc = InviteLinkService(session, bot)
-        link = await svc.get_or_create_personal_link(
-            user_id=callback.from_user.id, giveaway_id=giveaway_id
+        text = await _issue_personal_link(
+            user_id=callback.from_user.id,
+            giveaway_id=giveaway_id,
+            session=session,
+            bot=bot,
         )
-        await callback.message.answer(
-            f"Your personal invite link:\n<code>{link.invite_link}</code>\n\n"
-            "Share it. Only joins that Telegram reports with this exact link "
-            "are counted. One person = one referral max.",
-            parse_mode="HTML",
-        )
+        await callback.message.answer(text, parse_mode="HTML")
     except ValueError as e:
         await callback.message.answer(f"Cannot create link: {e}")
     except RuntimeError as e:
         await callback.message.answer(f"Telegram error: {e}")
     await callback.answer()
+
+
+@router.message(Command("myref"))
+async def cmd_myref(message: Message, session: AsyncSession, bot) -> None:
+    """Give the user their personal invite link for the current active contest."""
+    giveaway = await session.scalar(
+        select(Giveaway)
+        .where(Giveaway.status == GiveawayStatus.ACTIVE)
+        .order_by(Giveaway.created_at.desc())
+        .limit(1)
+    )
+    if giveaway is None:
+        await message.answer("No active contest right now.")
+        return
+    try:
+        text = await _issue_personal_link(
+            user_id=message.from_user.id,
+            giveaway_id=giveaway.id,
+            session=session,
+            bot=bot,
+        )
+        await message.answer(text, parse_mode="HTML")
+    except ValueError as e:
+        await message.answer(f"Cannot create link: {e}")
+    except RuntimeError as e:
+        await message.answer(f"Telegram error: {e}")
 
 
 @router.message(Command("mystats"))
