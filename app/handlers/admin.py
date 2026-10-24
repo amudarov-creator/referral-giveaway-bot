@@ -6,7 +6,7 @@ from uuid import uuid4
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -17,6 +17,8 @@ from app.models.giveaway import (
     GiveawayRequiredChannel,
     GiveawayStatus,
 )
+from app.models.referral import Referral, ReferralStatus
+from app.models.ticket import Ticket, TicketStatus
 from app.models.user import User
 from app.services.audit import write_audit
 from app.services.crypto import sha256_hex
@@ -198,6 +200,132 @@ async def activate(message: Message, session: AsyncSession) -> None:
     await message.answer("Giveaway is now ACTIVE. Rules are frozen.")
 
 
+@router.message(Command("pause"))
+async def pause_giveaway(message: Message, session: AsyncSession) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Usage: /pause <gid>")
+        return
+    g = await session.get(Giveaway, parts[1])
+    if not g or g.status != GiveawayStatus.ACTIVE:
+        await message.answer("Only an ACTIVE giveaway can be paused.")
+        return
+    g.status = GiveawayStatus.PAUSED
+    await write_audit(
+        session,
+        actor_id=message.from_user.id,
+        actor_type="admin",
+        action="giveaway_paused",
+        entity_type="giveaway",
+        entity_id=g.id,
+        giveaway_id=g.id,
+    )
+    await message.answer("Giveaway paused. New referrals will not be attributed until resume.")
+
+
+@router.message(Command("resume"))
+async def resume_giveaway(message: Message, session: AsyncSession) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Usage: /resume <gid>")
+        return
+    g = await session.get(Giveaway, parts[1])
+    if not g or g.status != GiveawayStatus.PAUSED:
+        await message.answer("Only a PAUSED giveaway can be resumed.")
+        return
+    g.status = GiveawayStatus.ACTIVE
+    await write_audit(
+        session,
+        actor_id=message.from_user.id,
+        actor_type="admin",
+        action="giveaway_resumed",
+        entity_type="giveaway",
+        entity_id=g.id,
+        giveaway_id=g.id,
+    )
+    await message.answer("Giveaway resumed (ACTIVE).")
+
+
+@router.message(Command("stats"))
+async def stats_giveaway(message: Message, session: AsyncSession) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Usage: /stats <gid>")
+        return
+    gid = parts[1]
+    g = await session.get(Giveaway, gid)
+    if not g:
+        await message.answer("Giveaway not found.")
+        return
+
+    verified = await session.scalar(
+        select(func.count()).where(
+            and_(
+                Referral.giveaway_id == gid,
+                Referral.status == ReferralStatus.VERIFIED,
+            )
+        )
+    )
+    pending = await session.scalar(
+        select(func.count()).where(
+            and_(
+                Referral.giveaway_id == gid,
+                Referral.status == ReferralStatus.PENDING,
+            )
+        )
+    )
+    suspicious = await session.scalar(
+        select(func.count()).where(
+            and_(
+                Referral.giveaway_id == gid,
+                Referral.status == ReferralStatus.SUSPICIOUS,
+            )
+        )
+    )
+    rejected = await session.scalar(
+        select(func.count()).where(
+            and_(
+                Referral.giveaway_id == gid,
+                Referral.status == ReferralStatus.REJECTED,
+            )
+        )
+    )
+    tickets = await session.scalar(
+        select(func.coalesce(func.sum(Ticket.weight), 0)).where(
+            and_(
+                Ticket.giveaway_id == gid,
+                Ticket.status == TicketStatus.ACTIVE,
+            )
+        )
+    )
+    participants = await session.scalar(
+        select(func.count(func.distinct(Ticket.user_id))).where(
+            and_(
+                Ticket.giveaway_id == gid,
+                Ticket.status == TicketStatus.ACTIVE,
+            )
+        )
+    )
+
+    text = (
+        f"<b>{g.title}</b>\n"
+        f"ID: <code>{g.id}</code>\n"
+        f"Status: {g.status}\n"
+        f"Channel: {g.channel_id}\n"
+        f"Starts: {g.starts_at}\n"
+        f"Ends: {g.ends_at}\n"
+        f"Rules hash: <code>{g.rules_hash or '—'}</code>\n"
+        f"Seed commitment: <code>{g.seed_commitment or '—'}</code>\n\n"
+        f"Referrals verified: {verified or 0}\n"
+        f"Referrals pending: {pending or 0}\n"
+        f"Referrals suspicious: {suspicious or 0}\n"
+        f"Referrals rejected: {rejected or 0}\n"
+        f"Active tickets (weight sum): {tickets or 0}\n"
+        f"Participants with tickets: {participants or 0}"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
 @router.message(Command("end"))
 async def end_giveaway(message: Message, session: AsyncSession) -> None:
     parts = (message.text or "").split()
@@ -208,7 +336,6 @@ async def end_giveaway(message: Message, session: AsyncSession) -> None:
     if not g or g.status not in (GiveawayStatus.ACTIVE, GiveawayStatus.PAUSED):
         await message.answer("Invalid status.")
         return
-    g.status = GiveawayStatus.ENDED
     g.verification_ends_at = utcnow() + timedelta(hours=settings.verification_period_hours)
     g.status = GiveawayStatus.VERIFICATION
     await write_audit(
