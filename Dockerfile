@@ -13,7 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+# pyproject.toml is required; README is optional (some hosts omit docs from context)
+COPY pyproject.toml ./
+COPY README.md* ./
+RUN if [ ! -f README.md ]; then echo "# referral-giveaway-bot" > README.md; fi
+
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
