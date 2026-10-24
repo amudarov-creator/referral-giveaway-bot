@@ -13,14 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# pyproject.toml is required; README is optional (some hosts omit docs from context)
+# Only files that must exist in the build context
 COPY pyproject.toml ./
-COPY README.md* ./
-RUN if [ ! -f README.md ]; then echo "# referral-giveaway-bot" > README.md; fi
-
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
+
+# README is required by pyproject.toml metadata; create stub so pip install works
+# even if the host omits README.md from the build context
+RUN echo "# referral-giveaway-bot" > README.md
 
 RUN pip install --upgrade pip && \
     pip install .
