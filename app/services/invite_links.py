@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -27,6 +29,10 @@ class InviteLinkService:
     async def get_or_create_personal_link(
         self, *, user_id: int, giveaway_id: str
     ) -> InviteLink:
+        """
+        Return existing active personal link or create a new one via Bot API.
+        Rate-limited per user (new links only; existing links are always returned).
+        """
         giveaway = await self.session.get(Giveaway, giveaway_id)
         if giveaway is None:
             raise ValueError("giveaway_not_found")
@@ -48,6 +54,8 @@ class InviteLinkService:
         )
         if existing:
             return existing
+
+        await self._enforce_create_rate_limit(user_id)
 
         user = await self.session.get(User, user_id)
         if user is None:
@@ -114,3 +122,20 @@ class InviteLinkService:
             entity_id=str(link_id),
             giveaway_id=link.giveaway_id,
         )
+
+    async def _enforce_create_rate_limit(self, user_id: int) -> None:
+        """Limit how many *new* invite links a user can create per hour."""
+        window = utcnow() - timedelta(hours=1)
+        created = await self.session.scalar(
+            select(func.count()).where(
+                and_(
+                    InviteLink.owner_id == user_id,
+                    InviteLink.created_at >= window,
+                )
+            )
+        )
+        limit = settings.invite_link_rate_limit_per_hour
+        if (created or 0) >= limit:
+            raise ValueError(
+                f"invite_link_rate_limit_exceeded:{limit}_per_hour"
+            )
